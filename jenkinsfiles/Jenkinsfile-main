@@ -1,0 +1,431 @@
+pipeline {
+    agent {
+        label 'centos-slave'
+    }
+    
+    parameters {
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['staging', 'pre-prod', 'prod'],
+            description: '选择部署环境'
+        )
+        booleanParam(
+            name: 'ROLLBACK',
+            defaultValue: false,
+            description: '是否执行回滚'
+        )
+        string(
+            name: 'ROLLBACK_VERSION',
+            defaultValue: '',
+            description: '回滚版本号（格式: timestamp或tag）'
+        )
+        booleanParam(
+            name: 'IS_RELEASE',
+            defaultValue: false,
+            description: '是否为正式发布版本'
+        )
+    }
+    
+    triggers {
+        pollSCM('H/2 * * * *')
+    }
+    
+    options {
+        timeout(time: 60, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+    
+    environment {
+        NEXUS_URL = 'http://192.168.233.8:8081'
+        HARBOR_URL = '192.168.233.9:8083'
+        SONAR_URL = 'http://192.168.233.8:9000'
+        TRIVY_URL = 'http://192.168.233.9:8084'
+        
+        // 版本管理
+        BUILD_TIMESTAMP = sh(script: 'date +%Y%m%d%H%M%S', returnStdout: true).trim()
+        VERSION_SUFFIX = "${params.IS_RELEASE ? '' : '-SNAPSHOT'}"
+        APP_VERSION = "${BUILD_TIMESTAMP}${VERSION_SUFFIX}"
+        GIT_COMMIT = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+    }
+    
+    stages {
+        stage('Checkout & Setup') {
+            steps {
+                checkout scm
+                script {
+                    currentBuild.displayName = "${APP_VERSION}-${params.DEPLOY_ENV}"
+                    env.DEPLOYMENT_VERSION = APP_VERSION
+                    env.GIT_COMMIT_SHORT = GIT_COMMIT
+                    
+                    // 创建部署清单
+                    writeJSON file: 'deployment-manifest.json', json: [
+                        application: "myapp",
+                        version: APP_VERSION,
+                        environment: params.DEPLOY_ENV,
+                        git_commit: GIT_COMMIT,
+                        build_time: sh(script: 'date -Iseconds', returnStdout: true).trim(),
+                        build_url: env.BUILD_URL,
+                        is_release: params.IS_RELEASE
+                    ]
+                }
+            }
+        }
+        
+        stage('Parallel Security & Build') {
+            when {
+                expression { !params.ROLLBACK }
+            }
+            parallel {
+                stage('Security Scan') {
+                    steps {
+                        script {
+                            // SonarQube分析
+                            withSonarQubeEnv('sonarqube') {
+                                sh """
+                                    mvn sonar:sonar \
+                                    -Dsonar.projectKey=myapp-${APP_VERSION} \
+                                    -Dsonar.projectName='My Application ${APP_VERSION}' \
+                                    -Dsonar.sources=src/main/java \
+                                    -Dsonar.tests=src/test/java \
+                                    -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+                                """
+                            }
+                            
+                            // OWASP依赖检查
+                            sh 'mvn org.owasp:dependency-check-maven:check -DskipTests'
+                            
+                            // SpotBugs代码分析
+                            sh 'mvn spotbugs:spotbugs -DskipTests'
+                            
+                            // 生成安全报告
+                            sh '''
+                                mvn spotbugs:spotbugs -DskipTests
+                                mvn org.owasp:dependency-check-maven:aggregate -DskipTests
+                            '''
+                        }
+                    }
+                }
+                
+                stage('Build & Package') {
+                    steps {
+                        script {
+                            // 版本化构建
+                            if (params.IS_RELEASE) {
+                                sh """
+                                    mvn -s settings.xml clean deploy \
+                                    -Drevision=${APP_VERSION} \
+                                    -DskipTests=false \
+                                    -P release
+                                """
+                            } else {
+                                sh """
+                                    mvn -s settings.xml clean deploy \
+                                    -Drevision=${APP_VERSION} \
+                                    -DskipTests=false \
+                                    -P snapshot
+                                """
+                            }
+                            
+                            // 构建Docker镜像
+                            sh """
+                                docker build \
+                                --build-arg APP_VERSION=${APP_VERSION} \
+                                --build-arg GIT_COMMIT=${GIT_COMMIT} \
+                                -t ${HARBOR_URL}/myapp:${APP_VERSION} \
+                                -t ${HARBOR_URL}/myapp:latest \
+                                .
+                            """
+                            
+                            // Trivy镜像扫描
+                            sh """
+                                trivy image --format template --template @html.tpl -o trivy-report.html ${HARBOR_URL}/myapp:${APP_VERSION}
+                            """
+                            
+                            // 推送镜像到Harbor
+                            withCredentials([usernamePassword(
+                                credentialsId: 'harbor-creds', 
+                                passwordVariable: 'HARBOR_PASSWORD', 
+                                usernameVariable: 'HARBOR_USERNAME'
+                            )]) {
+                                sh """
+                                    docker login -u ${HARBOR_USERNAME} -p ${HARBOR_PASSWORD} ${HARBOR_URL}
+                                    docker push ${HARBOR_URL}/myapp:${APP_VERSION}
+                                    docker push ${HARBOR_URL}/myapp:latest
+                                """
+                            }
+                        }
+                    }
+                }
+            }
+            
+            post {
+                always {
+                    archiveArtifacts artifacts: 'deployment-manifest.json,trivy-report.html', fingerprint: true
+                    publishHTML([
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true, 
+                        keepAll: true,
+                        reportDir: '.',
+                        reportFiles: 'trivy-report.html',
+                        reportName: '安全扫描报告'
+                    ])
+                }
+            }
+        }
+        
+        stage('Deploy to Staging') {
+            when {
+                expression { 
+                    !params.ROLLBACK && 
+                    (params.DEPLOY_ENV == 'staging' || params.DEPLOY_ENV == 'pre-prod' || params.DEPLOY_ENV == 'prod')
+                }
+            }
+            steps {
+                script {
+                    echo "开始部署到Staging环境，版本: ${APP_VERSION}"
+                    
+                    ansiblePlaybook(
+                        playbook: 'ansible-playbooks/deploy-with-rollback.yml',
+                        inventory: 'inventory/staging',
+                        extraVars: [
+                            app_version: APP_VERSION,
+                            deploy_env: 'staging',
+                            harbor_url: HARBOR_URL,
+                            enable_rollback: true,
+                            git_commit: GIT_COMMIT
+                        ],
+                        credentialsId: 'ansible-ssh-key'
+                    )
+                    
+                    // 记录部署版本
+                    sh """
+                        echo "${APP_VERSION}" > /opt/backups/myapp-staging.version
+                        echo "${APP_VERSION},${GIT_COMMIT},$(date -Iseconds)" >> /opt/backups/myapp-staging-deployments.log
+                    """
+                }
+            }
+        }
+        
+        stage('Deploy to Pre-Prod') {
+            when {
+                expression { 
+                    !params.ROLLBACK && 
+                    (params.DEPLOY_ENV == 'pre-prod' || params.DEPLOY_ENV == 'prod')
+                }
+            }
+            steps {
+                script {
+                    input message: "确认部署到Pre-Prod环境?\n版本: ${APP_VERSION}\nCommit: ${GIT_COMMIT}", 
+                    ok: '确认部署',
+                    submitterParameter: 'APPROVER'
+                    
+                    ansiblePlaybook(
+                        playbook: 'ansible-playbooks/deploy-with-rollback.yml', 
+                        inventory: 'inventory/pre-prod',
+                        extraVars: [
+                            app_version: APP_VERSION,
+                            deploy_env: 'pre-prod', 
+                            harbor_url: HARBOR_URL,
+                            enable_rollback: true,
+                            git_commit: GIT_COMMIT
+                        ],
+                        credentialsId: 'ansible-ssh-key'
+                    )
+                    
+                    sh """
+                        echo "${APP_VERSION}" > /opt/backups/myapp-pre-prod.version
+                        echo "${APP_VERSION},${GIT_COMMIT},$(date -Iseconds),${APPROVER}" >> /opt/backups/myapp-pre-prod-deployments.log
+                    """
+                }
+            }
+        }
+        
+        stage('Deploy to Production') {
+            when {
+                expression { 
+                    !params.ROLLBACK && 
+                    params.DEPLOY_ENV == 'prod'
+                }
+            }
+            steps {
+                script {
+                    input message: "确认部署到生产环境?\n版本: ${APP_VERSION}\nCommit: ${GIT_COMMIT}", 
+                    ok: '确认部署',
+                    submitterParameter: 'APPROVER'
+                    
+                    ansiblePlaybook(
+                        playbook: 'ansible-playbooks/deploy-with-rollback.yml',
+                        inventory: 'inventory/prod', 
+                        extraVars: [
+                            app_version: APP_VERSION,
+                            deploy_env: 'prod',
+                            harbor_url: HARBOR_URL, 
+                            enable_rollback: true,
+                            git_commit: GIT_COMMIT
+                        ],
+                        credentialsId: 'ansible-ssh-key'
+                    )
+                    
+                    // 记录生产版本
+                    sh """
+                        echo "${APP_VERSION}" > /opt/backups/myapp-prod.version
+                        echo "${APP_VERSION}" > /opt/backups/myapp-prod-latest.version
+                        echo "${APP_VERSION},${GIT_COMMIT},$(date -Iseconds),${APPROVER}" >> /opt/backups/myapp-prod-deployments.log
+                    """
+                    
+                    // 生产发布创建Git标签
+                    if (params.IS_RELEASE) {
+                        sh """
+                            git tag -a "v${APP_VERSION}" -m "Production release ${APP_VERSION}"
+                            git push origin "v${APP_VERSION}"
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Rollback') {
+            when {
+                expression { params.ROLLBACK }
+            }
+            steps {
+                script {
+                    echo "执行回滚到版本: ${params.ROLLBACK_VERSION}"
+                    
+                    ansiblePlaybook(
+                        playbook: 'ansible-playbooks/rollback.yml',
+                        inventory: "inventory/${params.DEPLOY_ENV}",
+                        extraVars: [
+                            rollback_version: params.ROLLBACK_VERSION,
+                            deploy_env: params.DEPLOY_ENV,
+                            harbor_url: HARBOR_URL
+                        ],
+                        credentialsId: 'ansible-ssh-key'
+                    )
+                    
+                    // 记录回滚操作
+                    sh """
+                        echo "${params.ROLLBACK_VERSION},${params.DEPLOY_ENV},rollback,$(date -Iseconds)" >> /opt/backups/myapp-rollbacks.log
+                    """
+                }
+            }
+        }
+        
+        stage('Post-Deployment Tests') {
+            when {
+                expression { !params.ROLLBACK && params.DEPLOY_ENV == 'prod' }
+            }
+            steps {
+                script {
+                    // 生产环境部署后测试
+                    sh """
+                        curl -f http://prod-server/health || exit 1
+                        curl -f http://prod-server/info | grep \"version\":\"${APP_VERSION}\" || exit 1
+                    """
+                    
+                    // 性能测试（简单版本）
+                    sh """
+                        ab -n 100 -c 10 http://prod-server/api/health
+                    """
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // 整个流水线状态邮件通知
+            emailext (
+                subject: "流水线完成: ${env.JOB_NAME} - ${currentBuild.result}",
+                body: """
+                =========== 流水线执行结果 ===========
+                项目: ${env.JOB_NAME}
+                构建: ${env.BUILD_NUMBER}
+                状态: ${currentBuild.result}
+                版本: ${APP_VERSION}
+                环境: ${params.DEPLOY_ENV}
+                Git Commit: ${GIT_COMMIT}
+                持续时间: ${currentBuild.durationString}
+                构建链接: ${env.BUILD_URL}
+                
+                ${currentBuild.result == 'SUCCESS' ? '✅ 流水线执行成功！' : '❌ 流水线执行失败！'}
+                
+                ${params.ROLLBACK ? '📦 执行了回滚操作' : '🚀 执行了部署操作'}
+                ${params.ROLLBACK ? '回滚版本: ' + params.ROLLBACK_VERSION : '部署版本: ' + APP_VERSION}
+                
+                详细信息请查看构建日志。
+                ===================================
+                """,
+                to: '251934304@qq.com',
+                from: '251934304@qq.com',
+                attachLog: true,
+                compressLog: true
+            )
+            
+            // 清理工作空间
+            cleanWs()
+        }
+        success {
+            script {
+                echo "流水线执行成功！"
+                // 记录成功指标
+                sh """
+                    echo "$(date -Iseconds),${env.JOB_NAME},${APP_VERSION},${params.DEPLOY_ENV},success,${currentBuild.durationString}" >> /opt/cicd/pipeline-metrics.log
+                """
+            }
+        }
+        failure {
+            script {
+                echo "流水线执行失败！"
+                // 记录失败指标
+                sh """
+                    echo "$(date -Iseconds),${env.JOB_NAME},${APP_VERSION},${params.DEPLOY_ENV},failure,${currentBuild.durationString}" >> /opt/cicd/pipeline-metrics.log
+                """
+                
+                // 失败时发送详细错误信息
+                emailext (
+                    subject: "🚨 流水线失败: ${env.JOB_NAME} - ${env.BUILD_NUMBER}",
+                    body: """
+                    🚨 流水线执行失败！
+                    
+                    项目: ${env.JOB_NAME}
+                    构建: ${env.BUILD_NUMBER} 
+                    版本: ${APP_VERSION}
+                    环境: ${params.DEPLOY_ENV}
+                    
+                    🔍 错误详情:
+                    ${currentBuild.rawBuild.getLog(100).join('\n')}
+                    
+                    📊 构建链接: ${env.BUILD_URL}
+                    
+                    ⚠️ 请及时检查并修复问题！
+                    """,
+                    to: '251934304@qq.com',
+                    from: '251934304@qq.com'
+                )
+            }
+        }
+        unstable {
+            emailext (
+                subject: "⚠️ 流水线不稳定: ${env.JOB_NAME} - ${env.BUILD_NUMBER}",
+                body: """
+                ⚠️ 流水线状态不稳定
+                
+                项目: ${env.JOB_NAME}
+                构建: ${env.BUILD_NUMBER}
+                版本: ${APP_VERSION}
+                环境: ${params.DEPLOY_ENV}
+                
+                可能的原因:
+                - 测试用例失败
+                - 代码质量门未通过
+                - 其他警告信息
+                
+                请检查构建详情: ${env.BUILD_URL}
+                """,
+                to: '251934304@qq.com',
+                from: '251934304@qq.com'
+            )
+        }
+    }
+}

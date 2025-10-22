@@ -8,7 +8,7 @@
     smtp_port: 587
     smtp_username: "251934304@qq.com"
     smtp_password: "vwmgolyxjrzncbca"
-
+    
   tasks:
     - name: 等待Jenkins完全启动
       wait_for:
@@ -144,6 +144,6 @@ $BUILD_LOG
           请访问 {{ jenkins_url }} 完成初始设置
           需要手动配置的凭证:
           - GitHub Token (github-token)
-          - QQ邮箱密码 (qq-email-credentials)
+          - QQ邮箱密码 (qq-email-credentials) 
           - SonarQube Token (sonar-token)
           - Harbor凭证 (harbor-creds)

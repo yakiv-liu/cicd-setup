@@ -8,7 +8,7 @@
     nexus_data: "/opt/cicd/nexus_data"
     sonarqube_data: "/opt/cicd/sonarqube_data"
     harbor_data: "/opt/cicd/harbor_data"
-
+    
   tasks:
     - name: 安装依赖包
       yum:
@@ -263,7 +263,7 @@
           SonarQube: http://192.168.233.8:9000
           Harbor: http://192.168.233.9:8083
           Trivy: http://192.168.233.9:8084
-
+          
           下一步操作:
           1. 获取Jenkins初始密码: docker exec jenkins-master cat /var/jenkins_home/secrets/initialAdminPassword
           2. 访问Jenkins并完成初始配置
