@@ -1,0 +1,149 @@
+---
+- name: 配置Jenkins和集成
+  hosts: master
+  become: yes
+  vars:
+    jenkins_url: "http://192.168.233.8:8080"
+    smtp_host: "smtp.qq.com"
+    smtp_port: 587
+    smtp_username: "251934304@qq.com"
+    smtp_password: "vwmgolyxjrzncbca"
+
+  tasks:
+    - name: 等待Jenkins完全启动
+      wait_for:
+        port: 8080
+        host: 127.0.0.1
+        delay: 30
+        timeout: 300
+
+    - name: 获取Jenkins初始密码
+      command: docker exec jenkins-master cat /var/jenkins_home/secrets/initialAdminPassword
+      register: jenkins_admin_password
+      changed_when: false
+
+    - name: 下载Jenkins CLI
+      get_url:
+        url: "{{ jenkins_url }}/jnlpJars/jenkins-cli.jar"
+        dest: "/tmp/jenkins-cli.jar"
+        mode: '0755'
+
+    - name: 创建Jenkins邮件配置
+      copy:
+        content: |
+          <?xml version='1.1' encoding='UTF-8'?>
+          <hudson.tasks.Mailer_-Descriptor plugin="mailer@1.34">
+            <defaultSuffix></defaultSuffix>
+            <hudsonUrl>{{ jenkins_url }}/</hudsonUrl>
+            <useSsl>false</useSsl>
+            <useTls>true</useTls>
+            <smtpHost>{{ smtp_host }}</smtpHost>
+            <smtpPort>{{ smtp_port }}</smtpPort>
+            <credentialsId>qq-email-credentials</credentialsId>
+            <charset>UTF-8</charset>
+          </hudson.tasks.Mailer_-Descriptor>
+        dest: "{{ jenkins_home }}/hudson.tasks.Mailer.xml"
+        owner: 1000
+        group: 1000
+
+    - name: 创建Email Extension配置
+      copy:
+        content: |
+          <?xml version='1.1' encoding='UTF-8'?>
+          <hudson.plugins.emailext.ExtendedEmailPublisherDescriptor plugin="email-ext@2.83">
+            <smtpServer>{{ smtp_host }}</smtpServer>
+            <smtpPort>{{ smtp_port }}</smtpPort>
+            <useSsl>false</useSsl>
+            <useTls>true</useTls>
+            <credentialsId>qq-email-credentials</credentialsId>
+            <charset>UTF-8</charset>
+            <defaultSubject>$PROJECT_NAME - Build #$BUILD_NUMBER - $BUILD_STATUS!</defaultSubject>
+            <defaultContent>
+项目: $PROJECT_NAME
+构建: #$BUILD_NUMBER
+状态: $BUILD_STATUS
+持续时间: $BUILD_DURATION
+URL: $BUILD_URL
+
+Changes:
+${CHANGES, showPaths=true, format="%a: %r %p \\n\"%m\"", pathFormat="\\n\\t%p"}
+
+Test Results:
+$FAILED_TESTS
+
+Console Output:
+$BUILD_LOG
+            </defaultContent>
+            <emergencyReroute></emergencyReroute>
+            <defaultReroute></defaultReroute>
+            <maxAttachmentSize>0</maxAttachmentSize>
+            <defaultPresendScript></defaultPresendScript>
+            <enableAuditToConsole>false</enableAuditToConsole>
+            <allowedDomains></allowedDomains>
+            <listId>jenkins-ci</listId>
+            <precedenceBulk>false</precedenceBulk>
+            <addCmdTrigger>false</addCmdTrigger>
+            <addDevTrigger>false</addDevTrigger>
+            <addCulpritsTrigger>false</addCulpritsTrigger>
+            <addUpstreamComitterTrigger>false</addUpstreamComitterTrigger>
+            <recipientList>251934304@qq.com</recipientList>
+          </hudson.plugins.emailext.ExtendedEmailPublisherDescriptor>
+        dest: "{{ jenkins_home }}/hudson.plugins.emailext.ExtendedEmailPublisher.xml"
+        owner: 1000
+        group: 1000
+
+    - name: 创建GitHub配置
+      copy:
+        content: |
+          <?xml version='1.1' encoding='UTF-8'?>
+          <jenkins.plugins.github.GitHubPluginConfiguration plugin="github@1.34.1">
+            <configs>
+              <jenkins.plugins.github.GitHubServerConfig>
+                <name>github.com</name>
+                <apiUrl>https://api.github.com</apiUrl>
+                <manageHooks>true</manageHooks>
+                <credentialsId>github-token</credentialsId>
+              </jenkins.plugins.github.GitHubServerConfig>
+            </configs>
+          </jenkins.plugins.github.GitHubPluginConfiguration>
+        dest: "{{ jenkins_home }}/jenkins.plugins.github.GitHubPluginConfiguration.xml"
+        owner: 1000
+        group: 1000
+
+    - name: 创建SonarQube配置
+      copy:
+        content: |
+          <?xml version='1.0' encoding='UTF-8'?>
+          <hudson.plugins.sonar.SonarGlobalConfiguration plugin="sonar@2.14">
+            <installations>
+              <hudson.plugins.sonar.SonarInstallation>
+                <name>sonarqube</name>
+                <serverUrl>http://192.168.233.8:9000</serverUrl>
+                <serverVersion>9.9</serverVersion>
+                <serverAuthenticationToken>sonar-token</serverAuthenticationToken>
+                <mojoVersion>3.9.1.2184</mojoVersion>
+                <additionalProperties></additionalProperties>
+                <additionalAnalysisProperties></additionalAnalysisProperties>
+                <triggers>
+                  <skipScmCause>false</skipScmCause>
+                  <skipUpstreamCause>false</skipUpstreamCause>
+                </triggers>
+              </hudson.plugins.sonar.SonarInstallation>
+            </installations>
+            <buildWrapperEnabled>true</buildWrapperEnabled>
+          </hudson.plugins.sonar.SonarGlobalConfiguration>
+        dest: "{{ jenkins_home }}/hudson.plugins.sonar.SonarGlobalConfiguration.xml"
+        owner: 1000
+        group: 1000
+
+    - name: 显示配置信息
+      debug:
+        msg: |
+          Jenkins配置完成！
+          初始管理员密码: {{ jenkins_admin_password.stdout }}
+          请访问 {{ jenkins_url }} 完成初始设置
+          需要手动配置的凭证:
+          - GitHub Token (github-token)
+          - QQ邮箱密码 (qq-email-credentials)
+          - SonarQube Token (sonar-token)
+          - Harbor凭证 (harbor-creds)
