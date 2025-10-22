@@ -1,0 +1,272 @@
+---
+- name: 部署完整的CI/CD环境
+  hosts: all
+  become: yes
+  vars:
+    docker_version: "20.10.23"
+    jenkins_home: "/opt/cicd/jenkins_home"
+    nexus_data: "/opt/cicd/nexus_data"
+    sonarqube_data: "/opt/cicd/sonarqube_data"
+    harbor_data: "/opt/cicd/harbor_data"
+
+  tasks:
+    - name: 安装依赖包
+      yum:
+        name:
+          - yum-utils
+          - device-mapper-persistent-data
+          - lvm2
+          - curl
+          - wget
+          - git
+          - unzip
+        state: present
+
+    - name: 添加Docker仓库
+      yum_repository:
+        name: docker-ce
+        description: Docker CE Stable
+        baseurl: https://download.docker.com/linux/centos/7/x86_64/stable
+        gpgcheck: yes
+        gpgkey: https://download.docker.com/linux/centos/gpg
+        enabled: yes
+
+    - name: 安装Docker
+      package:
+        name:
+          - docker-ce-{{ docker_version }}
+          - docker-ce-cli-{{ docker_version }}
+          - containerd.io
+        state: present
+
+    - name: 启动Docker服务
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: 安装Docker Compose
+      get_url:
+        url: https://github.com/docker/compose/releases/download/v2.17.3/docker-compose-linux-x86_64
+        dest: /usr/local/bin/docker-compose
+        mode: '0755'
+
+    - name: 创建cicd用户
+      user:
+        name: cicd
+        group: docker
+        system: yes
+        shell: /bin/bash
+
+- name: 部署数据库服务
+  hosts: database
+  become: yes
+  tasks:
+    - name: 创建数据库目录
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: 999
+        group: 999
+      loop:
+        - /opt/cicd/postgres_data
+
+    - name: 启动PostgreSQL
+      docker_container:
+        name: postgres-cicd
+        image: postgres:13-alpine
+        state: started
+        restart_policy: always
+        env:
+          POSTGRES_DB: sonarqube
+          POSTGRES_USER: sonar
+          POSTGRES_PASSWORD: sonar123
+          POSTGRES_MULTIPLE_DATABASES: "sonarqube,harbor"
+        ports:
+          - "5432:5432"
+        volumes:
+          - /opt/cicd/postgres_data:/var/lib/postgresql/data
+        memory: 256m
+        cpus: 0.5
+
+- name: 部署Master节点服务
+  hosts: master
+  become: yes
+  tasks:
+    - name: 创建数据目录
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: 1000
+        group: 1000
+      loop:
+        - "{{ jenkins_home }}"
+        - "{{ nexus_data }}"
+        - "{{ sonarqube_data }}"
+        - /opt/cicd/sonarqube_extensions
+        - /opt/cicd/sonarqube_logs
+
+    - name: 设置目录权限
+      file:
+        path: "{{ item }}"
+        owner: 1000
+        group: 1000
+        recurse: yes
+      loop:
+        - "{{ jenkins_home }}"
+        - "{{ nexus_data }}"
+        - "{{ sonarqube_data }}"
+
+    - name: 启动Jenkins Master
+      docker_container:
+        name: jenkins-master
+        image: jenkins/jenkins:lts-centos7
+        state: started
+        restart_policy: always
+        ports:
+          - "8080:8080"
+          - "50000:50000"
+        volumes:
+          - "{{ jenkins_home }}:/var/jenkins_home"
+          - /var/run/docker.sock:/var/run/docker.sock
+          - /usr/bin/docker:/usr/bin/docker
+        env:
+          JAVA_OPTS: "-Djava.awt.headless=true -Xmx512m -Xms256m"
+        memory: 1g
+        cpus: 1.0
+
+    - name: 启动Nexus
+      docker_container:
+        name: nexus
+        image: sonatype/nexus3:3.41.1
+        state: started
+        restart_policy: always
+        ports:
+          - "8081:8081"
+        volumes:
+          - "{{ nexus_data }}:/nexus-data"
+        env:
+          INSTALL4J_ADD_VM_PARAMS: "-Xms256m -Xmx512m -XX:MaxDirectMemorySize=512m"
+        memory: 512m
+        cpus: 0.5
+
+    - name: 启动SonarQube
+      docker_container:
+        name: sonarqube
+        image: sonarqube:9.9.1-community
+        state: started
+        restart_policy: always
+        ports:
+          - "9000:9000"
+        volumes:
+          - "{{ sonarqube_data }}:/opt/sonarqube/data"
+          - /opt/cicd/sonarqube_extensions:/opt/sonarqube/extensions
+          - /opt/cicd/sonarqube_logs:/opt/sonarqube/logs
+        env:
+          SONAR_JDBC_URL: "jdbc:postgresql://192.168.233.8:5432/sonarqube"
+          SONAR_JDBC_USERNAME: "sonar"
+          SONAR_JDBC_PASSWORD: "sonar123"
+          SONAR_WEB_JAVAOPTS: "-Xmx512m -Xms128m"
+        memory: 1g
+        cpus: 1.0
+
+    - name: 等待服务启动
+      wait_for:
+        port: "{{ item }}"
+        host: "127.0.0.1"
+        delay: 10
+        timeout: 120
+      loop:
+        - 8080
+        - 8081
+        - 9000
+
+- name: 部署Slave节点服务
+  hosts: slave
+  become: yes
+  tasks:
+    - name: 创建数据目录
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: 1000
+        group: 1000
+      loop:
+        - "{{ harbor_data }}"
+        - /opt/cicd/trivy_cache
+        - /opt/cicd/jenkins_slave
+
+    - name: 启动Harbor
+      docker_container:
+        name: harbor
+        image: goharbor/harbor-core:v2.8.2
+        state: started
+        restart_policy: always
+        ports:
+          - "8083:8080"
+        volumes:
+          - "{{ harbor_data }}:/data"
+        env:
+          CORE_SECRET: "secretkey"
+          EXT_ENDPOINT: "http://192.168.233.9:8083"
+          DATABASE_TYPE: "postgresql"
+          POSTGRESQL_HOST: "192.168.233.8"
+          POSTGRESQL_PORT: "5432"
+          POSTGRESQL_USERNAME: "harbor"
+          POSTGRESQL_PASSWORD: "harbor123"
+          POSTGRESQL_DATABASE: "harbor"
+        memory: 1g
+        cpus: 0.5
+
+    - name: 启动Trivy
+      docker_container:
+        name: trivy
+        image: aquasec/trivy:0.18.3
+        state: started
+        restart_policy: always
+        command: server --listen 0.0.0.0:8084
+        ports:
+          - "8084:8084"
+        volumes:
+          - /opt/cicd/trivy_cache:/root/.cache
+        memory: 256m
+        cpus: 0.3
+
+    - name: 创建Jenkins Slave容器
+      docker_container:
+        name: jenkins-slave
+        image: jenkins/inbound-agent:alpine-jdk11
+        state: started
+        restart_policy: always
+        ports:
+          - "2222:22"
+        env:
+          JENKINS_URL: "http://192.168.233.8:8080"
+          JENKINS_AGENT_NAME: "centos-slave-01"
+          JENKINS_SECRET: "{{ jenkins_slave_secret }}"
+        volumes:
+          - /opt/cicd/jenkins_slave:/home/jenkins/agent
+          - /var/run/docker.sock:/var/run/docker.sock
+          - /usr/bin/docker:/usr/bin/docker
+        memory: 512m
+        cpus: 0.5
+
+- name: 显示部署信息
+  hosts: localhost
+  tasks:
+    - name: 显示访问信息
+      debug:
+        msg: |
+          =========== CI/CD 环境部署完成 ===========
+          Jenkins Master: http://192.168.233.8:8080
+          Nexus: http://192.168.233.8:8081
+          SonarQube: http://192.168.233.8:9000
+          Harbor: http://192.168.233.9:8083
+          Trivy: http://192.168.233.9:8084
+
+          下一步操作:
+          1. 获取Jenkins初始密码: docker exec jenkins-master cat /var/jenkins_home/secrets/initialAdminPassword
+          2. 访问Jenkins并完成初始配置
+          3. 在Jenkins中配置Slave节点，使用secret: {{ jenkins_slave_secret }}
+          4. 运行配置脚本: ansible-playbook -i inventory.ini configure-jenkins.yml
+          =========================================
