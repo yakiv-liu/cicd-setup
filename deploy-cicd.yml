@@ -1,5 +1,5 @@
 ---
-- name: 部署完整的CI/CD环境
+- name: 部署完整的CI/CD环境（Python 3兼容版）
   hosts: all
   become: yes
   vars:
@@ -10,34 +10,32 @@
     harbor_data: "/opt/cicd/harbor_data"
     
   tasks:
+    # ========== 修改点1：使用command模块替代yum模块 ==========
     - name: 安装依赖包
-      yum:
-        name:
-          - yum-utils
-          - device-mapper-persistent-data
-          - lvm2
-          - curl
-          - wget
-          - git
-          - unzip
-        state: present
+      command: "yum install -y {{ item }}"
+      loop:
+        - yum-utils
+        - device-mapper-persistent-data
+        - lvm2
+        - curl
+        - wget
+        - git
+        - unzip
+      args:
+        warn: false
 
+    # ========== 修改点2：使用get_url直接下载repo文件 ==========
     - name: 添加Docker仓库
-      yum_repository:
-        name: docker-ce
-        description: Docker CE Stable
-        baseurl: https://download.docker.com/linux/centos/7/x86_64/stable
-        gpgcheck: yes
-        gpgkey: https://download.docker.com/linux/centos/gpg
-        enabled: yes
+      get_url:
+        url: https://download.docker.com/linux/centos/docker-ce.repo
+        dest: /etc/yum.repos.d/docker-ce.repo
+        mode: '0644'
 
+    # ========== 修改点3：使用command安装Docker ==========
     - name: 安装Docker
-      package:
-        name:
-          - docker-ce-{{ docker_version }}
-          - docker-ce-cli-{{ docker_version }}
-          - containerd.io
-        state: present
+      command: "yum install -y docker-ce-{{ docker_version }} docker-ce-cli-{{ docker_version }} containerd.io"
+      args:
+        warn: false
 
     - name: 启动Docker服务
       systemd:
@@ -81,7 +79,6 @@
           POSTGRES_DB: sonarqube
           POSTGRES_USER: sonar
           POSTGRES_PASSWORD: sonar123
-          POSTGRES_MULTIPLE_DATABASES: "sonarqube,harbor"
         ports:
           - "5432:5432"
         volumes:
@@ -150,7 +147,17 @@
         memory: 512m
         cpus: 0.5
 
-    - name: 启动SonarQube
+    - name: 等待服务启动
+      wait_for:
+        port: "{{ item }}"
+        host: "127.0.0.1"
+        delay: 10
+        timeout: 120
+      loop:
+        - 8080
+        - 8081
+
+    - name: 启动SonarQube（等待PostgreSQL就绪）
       docker_container:
         name: sonarqube
         image: sonarqube:9.9.1-community
@@ -169,17 +176,6 @@
           SONAR_WEB_JAVAOPTS: "-Xmx512m -Xms128m"
         memory: 1g
         cpus: 1.0
-
-    - name: 等待服务启动
-      wait_for:
-        port: "{{ item }}"
-        host: "127.0.0.1"
-        delay: 10
-        timeout: 120
-      loop:
-        - 8080
-        - 8081
-        - 9000
 
 - name: 部署Slave节点服务
   hosts: slave
